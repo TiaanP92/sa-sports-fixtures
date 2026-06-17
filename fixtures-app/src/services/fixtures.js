@@ -1,8 +1,6 @@
 // ── Sports data service ────────────────────────────────────────────────────
-// Strategy: TheSportsDB (free, no key) first, Claude AI (with web search) for
-// full coverage per the SA Sports Fixtures spec.
-
-const TSDB = 'https://www.thesportsdb.com/api/v1/json/3';
+// All external API calls go through /api/* Vercel serverless functions
+// to avoid CORS issues when running in the browser.
 
 export function fmtDate(d) {
   return d.toISOString().split('T')[0];
@@ -38,20 +36,12 @@ export function getDaysInView(view) {
   });
 }
 
-// ── TheSportsDB ────────────────────────────────────────────────────────────
+// ── TheSportsDB (via /api/sportsdb proxy) ─────────────────────────────────
 
 const LEAGUE_IDS = {
   epl: 4328, ucl: 4480, superRugbyPacific: 4509,
   urc: 4800, ipl: 5552, f1: 4370,
 };
-
-async function tsdbFetch(path) {
-  try {
-    const r = await fetch(`${TSDB}${path}`);
-    if (!r.ok) return null;
-    return await r.json();
-  } catch { return null; }
-}
 
 function formatTimeSAST(strTime) {
   if (!strTime) return 'TBC';
@@ -77,16 +67,14 @@ function mapSport(strSport) {
 
 function getHighlight(home, away, league) {
   const str = `${home} ${away} ${league}`.toLowerCase();
-  if (str.includes('springbok') || str.includes('south africa') ||
-      str.includes(' sa ') || str.includes('proteas')) {
+  if (str.includes('springbok') || str.includes('south africa') || str.includes('proteas')) {
     return { highlight: true, highlightLabel: '🟢 Springboks' };
   }
   if (str.includes('grey college') || str.includes('grey coll')) {
     return { highlight: true, highlightLabel: '⭐ Grey College' };
   }
-  if (str.includes('bulls') || str.includes('lions') ||
-      str.includes('sharks') || str.includes('stormers') ||
-      str.includes('cheetahs') || str.includes('griquas')) {
+  if (str.includes('bulls') || str.includes('lions') || str.includes('sharks') ||
+      str.includes('stormers') || str.includes('cheetahs') || str.includes('griquas')) {
     return { highlight: true, highlightLabel: '🟢 SA Team' };
   }
   return { highlight: false, highlightLabel: null };
@@ -94,8 +82,10 @@ function getHighlight(home, away, league) {
 
 export async function fetchFromSportsDB(dateStr) {
   const results = [];
-  const promises = Object.values(LEAGUE_IDS).map(id =>
-    tsdbFetch(`/eventsday.php?d=${dateStr}&l=${id}`)
+  const promises = Object.entries(LEAGUE_IDS).map(([, id]) =>
+    fetch(`/api/sportsdb?date=${dateStr}&leagueId=${id}`)
+      .then(r => r.ok ? r.json() : null)
+      .catch(() => null)
   );
   const responses = await Promise.allSettled(promises);
   responses.forEach(res => {
@@ -127,7 +117,7 @@ export async function fetchFromSportsDB(dateStr) {
   return results;
 }
 
-// ── Claude AI (with web search) ────────────────────────────────────────────
+// ── Claude AI (via /api/claude proxy) ─────────────────────────────────────
 
 const CLAUDE_SYSTEM = `You are a sports fixtures assistant for a South African audience.
 Return ONLY a valid JSON array. No markdown, no explanation, no code fences, no preamble.
@@ -150,35 +140,14 @@ Each fixture object must have exactly these fields:
 INCLUSION RULES — only include these competitions:
 
 FOOTBALL: Premier League, UEFA Champions League, FIFA World Cup only.
-Exclude all other football (friendlies, lower leagues, other European leagues).
-
 TENNIS: Grand Slams only (Australian Open, French Open/Roland Garros, Wimbledon, US Open).
-Exclude all ATP/WTA Tour, Masters 1000/500/250, Davis Cup, Billie Jean King Cup, exhibitions.
-
-CRICKET: Include ALL of the following:
-- International cricket: all Tests, ODIs, T20Is, ICC tournaments
-- SA domestic: CSA T20 Challenge, CSA One-Day Cup, Momentum One-Day Cup, 4-Day Domestic Series
-- All professional T20 leagues worldwide: SA20, IPL, The Hundred, BBL, CPL, PSL, ILT20, LPL, MLC
-Exclude club cricket, school cricket, age-group cricket.
-
-RUGBY: Include:
-- Super Rugby Pacific, Super Rugby Americas, Super Rugby Africa
-- URC (United Rugby Championship)
-- Champions Cup, European Challenge Cup
-- SA domestic: Currie Cup, Carling Xtreme Cup
-- SA schoolboy rugby: ALL major fixtures, flag Grey College prominently
-- Craven Week and major schoolboy tournaments
-- International: Rugby Championship, British & Irish Lions, Six Nations, Autumn Internationals, Rugby World Cup
-- Highlight ALL Springbok fixtures prominently
-Exclude club/amateur rugby below professional level, non-SA schoolboy games.
-
-GOLF: All four Majors (Masters, US Open, The Open, PGA Championship), PGA Tour, DP World Tour.
-
+CRICKET: All international cricket (Tests, ODIs, T20Is, ICC tournaments), SA domestic (CSA T20 Challenge, CSA One-Day Cup, Momentum One-Day Cup, 4-Day Domestic), all professional T20 leagues (SA20, IPL, The Hundred, BBL, CPL, PSL, ILT20, LPL, MLC).
+RUGBY: Super Rugby (Pacific/Americas/Africa), URC, Champions Cup, European Challenge Cup, Currie Cup, Carling Xtreme Cup, Rugby Championship, Six Nations, British & Irish Lions, Autumn Internationals, Rugby World Cup, major SA schoolboy rugby, Craven Week. Flag Grey College and all Springbok fixtures prominently.
+GOLF: The four Majors, PGA Tour, DP World Tour.
 F1: ALL sessions — FP1, FP2, FP3, Qualifying, Sprint Qualifying, Sprint Race, Race.
+ATHLETICS: Diamond League, World Athletics Championships, Olympic athletics.
 
-ATHLETICS: Diamond League, World Athletics Championships, Olympic athletics only.
-
-Return [] if nothing matches these criteria on the requested date.`;
+Return [] if nothing matches on the requested date.`;
 
 export async function fetchFromClaude(apiKey, dateStr) {
   const date = new Date(dateStr + 'T12:00:00Z');
@@ -187,17 +156,20 @@ export async function fetchFromClaude(apiKey, dateStr) {
 
   const userPrompt = `Use web search to find all sports fixtures on ${dayName} ${fullDate}.
 Apply the inclusion rules exactly. Return ALL matching fixtures as a JSON array in SAST times.
-Be thorough — search for rugby, cricket, football, tennis, golf, F1, and athletics separately if needed.`;
+Search for rugby, cricket, football, tennis, golf, F1, and athletics.`;
 
-  const response = await fetch('https://api.anthropic.com/v1/messages', {
+  const response = await fetch('/api/claude', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 1000,
-      system: CLAUDE_SYSTEM,
-      tools: [{ type: 'web_search_20250305', name: 'web_search' }],
-      messages: [{ role: 'user', content: userPrompt }],
+      apiKey,
+      body: {
+        model: 'claude-sonnet-4-6',
+        max_tokens: 1000,
+        system: CLAUDE_SYSTEM,
+        tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+        messages: [{ role: 'user', content: userPrompt }],
+      },
     }),
   });
 
@@ -252,16 +224,16 @@ function sortFixtures(fixtures) {
 }
 
 export async function fetchFixturesForDate(dateStr, apiKey) {
-  const [sportsDbFixtures, claudeFixtures] = await Promise.allSettled([
+  const [sportsDbResult, claudeResult] = await Promise.allSettled([
     fetchFromSportsDB(dateStr),
     apiKey ? fetchFromClaude(apiKey, dateStr) : Promise.resolve([]),
   ]);
 
-  const sdb = sportsDbFixtures.status === 'fulfilled' ? sportsDbFixtures.value : [];
-  const cl  = claudeFixtures.status === 'fulfilled'  ? claudeFixtures.value  : [];
+  const sdb = sportsDbResult.status === 'fulfilled' ? sportsDbResult.value : [];
+  const cl  = claudeResult.status === 'fulfilled'  ? claudeResult.value  : [];
 
-  if (claudeFixtures.status === 'rejected') {
-    throw claudeFixtures.reason;
+  if (claudeResult.status === 'rejected') {
+    throw claudeResult.reason;
   }
 
   return sortFixtures(dedupe(sdb, cl));
